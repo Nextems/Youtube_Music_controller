@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  background: transparent;
+}
+
+/* Window dragging is NOT done in CSS: no `-webkit-app-region` anywhere
+   (it made Chromium track drag/no-drag rects and route input through the
+   host window). Drag handles are plain elements with the
+   data-tauri-drag-region attribute - see App.jsx. */
+
+/* Slim, unobtrusive scrollbar for the queue / playlists lists */
+.queue-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.queue-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}
+
+/* Scroll lists: keep the wheel inside the list (no chaining to the page).
+   That is ALL they need. Earlier versions stacked several "performance"
+   tricks here - translateZ/will-change layers, `pointer-events: none`
+   while scrolling, and `.gpu-panel:has(.is-scrolling) { backdrop-filter:
+   none }` - none of which were measured, and together they were the most
+   likely cause of the list freezing (see PROJECT_MAP.md section 4.8 / 5):
+   toggling pointer-events / backdrop-filter in the middle of a wheel
+   gesture makes Chromium re-hit-test and re-composite the whole card at
+   the start and the end of every scroll. */
+.queue-scroll {
+  overscroll-behavior: contain;
+}

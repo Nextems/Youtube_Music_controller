@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "remote-ytm-capability",
+  "description": "Lets the injected watcher script running on music.youtube.com (inside the hidden 'main' window) emit ytm://state events back to the app. Scoped narrowly to this one origin only.",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://music.youtube.com/*"]
+  },
+  "permissions": ["core:event:default"]
+}
