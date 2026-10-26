@@ -17,7 +17,7 @@ function QueueList({
   if (queue.length === 0) {
     return (
       <p className="text-center text-sm text-slate-500 py-6">
-        Open the queue panel in YouTube Music to see upcoming tracks here.
+        No tracks in the visible player queue.
       </p>
     );
   }

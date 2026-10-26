@@ -16,8 +16,7 @@ function PlaylistsPanel({ playlists, loading, onPlay }) {
   if (playlists.length === 0) {
     return (
       <p className="text-center text-sm text-slate-500 py-6 px-2">
-        No playlists found. This reads YouTube Music's own sidebar, so if
-        your library is large it may only catch pinned/recent playlists.
+        No playlists found in the player's sidebar. Open your library in the player to load them.
       </p>
     );
   }

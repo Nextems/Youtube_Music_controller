@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import { note } from "./overlayDiag.js";
 
 /**
@@ -12,13 +13,13 @@ import { note } from "./overlayDiag.js";
  * selectors (the <video> element, the queue item list) and should hold
  * up well. The sidebar playlist ones (fetchPlaylists, playPlaylist) run
  * on markup verified in devtools (see ytm-watcher.js). The
- * addQueueItemToPlaylist/confirmAddToPlaylist menu flow depends on
- * transient popup menus whose exact markup can't be inspected live -
- * treat it as a first draft to test against the real DOM.
+ * Playlist saving uses the native picker and DOM helpers in ytm-watcher.js.
  */
 function evalInMain(script) {
   note("ytm_eval");
-  return invoke("ytm_eval", { script });
+  return invoke("ytm_eval", { script }).catch((error) => {
+    return emit("ytm://error", String(error)).catch(console.error);
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -70,38 +71,9 @@ export function skip(deltaSeconds) {
   `);
 }
 
-/** Seek to `targetSeconds` INTO THE CURRENT TRACK (the same track-relative
- *  timebase the overlay's UI shows - 0 is the start of the current song),
- *  given `knownElapsedSeconds` - the caller's last CONFIRMED elapsed-in-
- *  track reading (i.e. from the most recent ytm://tick, not an optimistic
- *  drag preview - see commitSeek in usePlaybackState.js).
- *
- *  video.currentTime itself is not track-relative: YTM runs one continuous,
- *  non-resetting clock across the whole queued session (see the TIMER NOTE
- *  in ytm-watcher.js). An earlier version of this function tried to
- *  compensate by reconstructing an absolute session-time target (adding
- *  back a cached per-track start offset maintained by the watcher's
- *  1-second poll) - but that offset can be stale relative to the exact
- *  instant of the seek, and a stale anchor sends the seek to the wrong
- *  place in the session regardless of how far the target is from the
- *  track's edges.
- *
- *  This version sidesteps that cache entirely: it takes the DIFFERENCE
- *  between where we want to be and where we last confirmed we actually
- *  are (both in the same track-relative timebase, so the difference is
- *  offset-independent - the per-track anchor cancels out), then applies
- *  that as a relative adjustment to a video.currentTime read FRESH in
- *  this same call - exactly how skip() already does it reliably above,
- *  just with a computed delta instead of a fixed +/-15. */
-export function seekTo(targetSeconds, knownElapsedSeconds) {
-  return evalInMain(`
-    (function () {
-      const video = document.querySelector("video");
-      if (!video || !isFinite(${targetSeconds}) || !isFinite(${knownElapsedSeconds})) return;
-      const delta = (${targetSeconds}) - (${knownElapsedSeconds});
-      video.currentTime = Math.max(0, video.currentTime + delta);
-    })();
-  `);
+/** Seek using a fresh page-side reading, rather than a stale overlay tick. */
+export function seekTo(targetSeconds) {
+  return evalInMain(`window.__ymoverlay.seekTo(${JSON.stringify(targetSeconds)})`);
 }
 
 /** percent: 0-100. Routes through window.__ymoverlay.setTargetVolume,
@@ -142,28 +114,18 @@ export function setQueuePanelOpen(open) {
   `);
 }
 
+export function setPlaylistsPanelOpen(open) {
+  return evalInMain(`if (window.__ymoverlay) window.__ymoverlay.playlistsPanelOpen = ${!!open};`);
+}
+
 // ---------------------------------------------------------------------
-// Queue - high confidence for selection, since it indexes through the
-// exact same window.__ymoverlay.getQueueItems() filtered list the
-// watcher's readQueue() uses to build the indices the UI shows.
+// Queue references are stable IDs assigned by the watcher.
 // ---------------------------------------------------------------------
 
-/** Clicks a specific row in the currently rendered queue panel by index
- *  (matches the index the watcher reported in its ytm://queue payload).
- *  Tries several inner elements before the row itself, since a synthetic
- *  .click() on a custom element only reaches listeners on that element
- *  or its ancestors - if YTM's real "play this" handler lives on an
- *  inner child (a common pattern), clicking only the outer host would
- *  silently do nothing. */
 export function selectQueueItem(index) {
   return evalInMain(`
     (function () {
-      // Must use the SAME filtered list the watcher's readQueue() reports
-      // indices against (window.__ymoverlay.getQueueItems), not a raw
-      // querySelectorAll - YTM renders hidden/duplicate queue-item nodes
-      // that throw off raw DOM indices vs. the visible list the UI shows.
-      const items = window.__ymoverlay.getQueueItems();
-      const el = items[${index}];
+      const el = window.__ymoverlay.getQueueItem(${JSON.stringify(index)});
       if (!el) return;
 
       const candidates = [
@@ -173,100 +135,26 @@ export function selectQueueItem(index) {
         el.shadowRoot && el.shadowRoot.querySelector("#thumbnail, .song-info, [role='button']"),
       ].filter(Boolean);
 
-      candidates.forEach((c) => c.click());
-      // Always also click the row itself, in case the real handler is on
-      // the host element (or uses event delegation from a parent).
-      el.click();
+      // One bubbling click reaches both the inner control and its host.
+      (candidates[0] || el).click();
     })();
   `);
 }
 
 // ---------------------------------------------------------------------
-// Track overflow menu ("Add to playlist") - EXPERIMENTAL.
-// Simulates the exact path a real user takes in YTM's own UI: opens
-// that queue row's own "..." button, then clicks its "Add to playlist"
-// (aka "Save to playlist") item. Both lookups are LANGUAGE-INDEPENDENT
-// (see findRowMenuButton/findAddToPlaylistMenuItem in ytm-watcher.js) -
-// neither depends on a hardcoded English string, so this holds up
-// regardless of which language YTM's UI is currently displaying.
+// Playlist picker: the watcher owns DOM discovery, choice identity and errors.
 // ---------------------------------------------------------------------
 
-function openAddToPlaylistMenuScript(index) {
-  return `
-    (function () {
-      try {
-        const items = window.__ymoverlay.getQueueItems();
-        const el = items[${index}];
-        if (!el) return;
-        const menuBtn = window.__ymoverlay.findRowMenuButton(el);
-        if (menuBtn) menuBtn.click();
-      } catch (e) {}
-    })();
-  `;
+export function addQueueItemToPlaylist(index) {
+  return evalInMain(`window.__ymoverlay.openPlaylistPicker(${JSON.stringify(index)})`);
 }
 
-/** Opens the row's own "..." menu (in the real YTM UI), clicks its "add
- *  to playlist" item, then scrapes whatever picker/dialog appears and
- *  emits its options back as "ytm://add-to-playlist-options"
- *  ({ index, options: [{ label }] }). Call confirmAddToPlaylist(label)
- *  next, while that picker is still open. */
-export async function addQueueItemToPlaylist(index) {
-  await evalInMain(openAddToPlaylistMenuScript(index));
-  return evalInMain(`
-    (async function () {
-      await window.__ymoverlay.wait(300);
-      const menuRoot = window.__ymoverlay.findDialogRoot();
-      const target = window.__ymoverlay.findAddToPlaylistMenuItem(menuRoot);
-      if (target) target.click();
-
-      // The add-to-playlist dialog often fetches the user's playlists
-      // before rendering, so give it a couple of chances rather than one
-      // fixed wait.
-      let options = [];
-      for (let attempt = 0; attempt < 3 && options.length === 0; attempt++) {
-        await window.__ymoverlay.wait(400);
-        try {
-          const root = window.__ymoverlay.findDialogRoot();
-          const optionEls = Array.from(
-            root.querySelectorAll(
-              "ytmusic-playlist-add-to-option-renderer, tp-yt-paper-item, ytmusic-menu-navigation-item-renderer"
-            )
-          ).filter((el) => el.offsetParent !== null);
-          options = optionEls
-            .map((el) => ({ label: el.textContent.trim() }))
-            .filter((o) => o.label);
-        } catch (e) {
-          options = [];
-        }
-      }
-
-      window.__TAURI__.event.emit("ytm://add-to-playlist-options", {
-        index: ${index},
-        options: options.slice(0, 20),
-      });
-    })();
-  `);
+export function confirmAddToPlaylist(id) {
+  return evalInMain(`window.__ymoverlay.confirmPlaylistChoice(${JSON.stringify(id)})`);
 }
 
-/** Clicks the option matching `label` in the currently-open add-to-playlist
- *  picker (call right after addQueueItemToPlaylist resolves). Scoped to
- *  the actual dialog root rather than the whole document, so it can't
- *  accidentally match similar text elsewhere on the page (e.g. the
- *  sidebar) instead of the real checkbox/option. Matching against
- *  `label` here is NOT a locale concern - it's the exact playlist NAME
- *  the user themselves picked from our own scraped list, not translated
- *  YTM UI chrome. */
-export function confirmAddToPlaylist(label) {
-  return evalInMain(`
-    (function () {
-      const root = window.__ymoverlay.findDialogRoot();
-      window.__ymoverlay.clickByTextIn(
-        root,
-        ["ytmusic-playlist-add-to-option-renderer", "tp-yt-paper-item", "ytmusic-menu-navigation-item-renderer"],
-        ${JSON.stringify(label)}
-      );
-    })();
-  `);
+export function cancelAddToPlaylist() {
+  return evalInMain('window.__ymoverlay.cancelPlaylistChoice()');
 }
 
 // ---------------------------------------------------------------------

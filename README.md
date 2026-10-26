@@ -36,7 +36,7 @@ Other platforms are not tested. Parts of the code are Windows/WebView2-specific.
 3. Sign in to YouTube Music in the first window (only the first time – the session is stored by the app).
 4. Start playing something. The overlay follows the player.
 
-**Keep the YouTube Music window open** (you can minimize it or put it behind other windows). It is the actual player; closing it stops the music and the overlay has nothing to control.
+Closing the player window hides it while music continues. Use the monitor button to show it again. The left buttons switch between YouTube Music and Spotify; switching destroys the previous player window.
 
 ## Usage
 
@@ -58,10 +58,8 @@ Other platforms are not tested. Parts of the code are Windows/WebView2-specific.
 Prerequisites: [Node.js 18+](https://nodejs.org), [Rust (stable)](https://www.rust-lang.org/tools/install) and the [Tauri prerequisites for Windows](https://v2.tauri.app/start/prerequisites/) (Visual Studio Build Tools with the "Desktop development with C++" workload).
 
 ```bash
+cd ymoverlay
 npm install
-
-# app icons (a 1024x1024 PNG of your choice) – needed for a production build
-npx tauri icon path/to/logo.png
 
 # run in development mode
 npm run tauri dev
@@ -74,14 +72,15 @@ Stack: [Tauri 2](https://tauri.app) (Rust) + React 18 + Vite + Tailwind CSS.
 
 ## How it works
 
-The app is two Tauri windows:
+The overlay and the selected player are separate Tauri windows:
 
 | Window | Shows | Role |
 |---|---|---|
 | `main` | the real `music.youtube.com` | the player and your logged-in session |
+| `spotify` | `open.spotify.com`, when selected instead of YTM | the Spotify player and session |
 | `overlay` | this project's React UI | the compact controller |
 
-A script (`src-tauri/scripts/ytm-watcher.js`) is injected into `main` at startup. It reads the page (track, timer, queue, sidebar playlists) and sends changes to the overlay as Tauri events. Commands go the other way: the overlay builds small JavaScript snippets (`src/lib/ytmBridge.js`) and sends them to `main` through the `ytm_eval` command, where they click the same buttons you would.
+A script (`src-tauri/scripts/ytm-watcher.js`) is injected into `main` on every document load. Spotify uses `spotify-watcher.js` and `spotifyBridge.js` in the same way. It reads the page (track, timer, queue, sidebar playlists) and sends changes to the overlay as Tauri events. Commands go the other way: the overlay builds small JavaScript snippets (`src/lib/ytmBridge.js`) and sends them to `main` through the `ytm_eval` command, where they click the same buttons you would.
 
 For the full architecture and the list of past bugs and their fixes, see [`PROJECT_MAP.md`](PROJECT_MAP.md).
 
@@ -97,7 +96,7 @@ For the full architecture and the list of past bugs and their fixes, see [`PROJE
 ## Troubleshooting
 
 - **The overlay shows "Nothing playing"** – start a track in the YouTube Music window and make sure you are signed in.
-- **Nothing reacts** – make sure the YouTube Music window has not been closed.
+- **Nothing reacts** – show the selected player with the monitor button and check that its page has loaded.
 - **Diagnostics** – in DevTools of the YouTube Music window, `window.__ymoverlay.enableDiagnostics()` logs long tasks and timer drift; in DevTools of the overlay, `window.__ovDiag.enable()` logs scroll/input delays.
 
 ## Contributing

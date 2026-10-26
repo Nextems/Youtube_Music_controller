@@ -23,18 +23,19 @@ function PlaylistRow({ playlist, onPlay }) {
             <p className="text-sm text-slate-400 truncate">{playlist.author}</p>
           )}
         </div>
-        <span
-          role="button"
+        <button
+          type="button"
           aria-label="Playlist options"
+          aria-expanded={menuOpen}
           onClick={toggleMenu}
           className="p-1 -m-1 rounded hover:bg-white/10 shrink-0"
         >
           <MoreHorizontal size={18} className="text-slate-400" />
-        </span>
+        </button>
       </div>
 
       {menuOpen && (
-        <div className="absolute right-2 top-full mt-1 z-20 w-44 rounded-xl bg-[#20242e] border border-white/10 shadow-xl overflow-hidden">
+        <div className="relative ml-auto mr-2 mb-1 w-44 rounded-xl bg-[#20242e] border border-white/10 shadow-xl overflow-hidden">
           <button
             type="button"
             onClick={() => handlePlay(true)}

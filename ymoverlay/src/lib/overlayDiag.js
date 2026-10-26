@@ -14,8 +14,7 @@
 //   frame gap Xms         overlay's own frames stopped (rAF gap).
 //
 // and, after a slow wheel/scroll, the last few things that happened just
-// before it: Tauri events received from YTM (ytm://tick/queue/...) and
-// ytm_eval commands sent to it, each with its age.
+// before it: Tauri events and commands for both players, each with its age.
 //
 // How to read it:
 //   * scroll response / wheel latency high, NO long task, NO frame gap
@@ -28,13 +27,10 @@
 
 import { listen } from "@tauri-apps/api/event";
 
-const EVENTS = [
-  "ytm://tick",
-  "ytm://track",
-  "ytm://queue",
-  "ytm://playlists",
-  "ytm://add-to-playlist-options",
-];
+const EVENTS = ["ytm", "spotify"].flatMap((provider) =>
+  ["tick", "track", "queue", "playlists", "add-to-playlist-options", "error"]
+    .map((name) => `${provider}://${name}`)
+);
 
 let enabled = false;
 const recent = [];

@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/remote-schema.json",
+  "identifier": "remote-spotify-capability",
+  "description": "Allows the Spotify DOM watcher to send playback events to the overlay.",
+  "windows": ["spotify"],
+  "remote": { "urls": ["https://open.spotify.com/*"] },
+  "permissions": ["core:event:allow-emit-to"]
+}

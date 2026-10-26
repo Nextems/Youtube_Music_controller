@@ -1,5 +1,4 @@
-// Injected into the hidden "main" window (music.youtube.com) once at app
-// startup via WebviewWindow::eval() in main.rs.
+// Initialized on each YouTube Music document load by the shared player builder.
 //
 // SELECTOR NOTE: these class/id names come from YouTube Music's current
 // web player markup and are NOT a public API - Google can and does change
@@ -17,19 +16,17 @@
 // Diffing happens here (in the page), not in React, so unchanged data never
 // even crosses the IPC boundary.
 //
-// TIMER NOTE: YTM does not reset <video>.currentTime to 0 between queued
-// tracks - it runs one continuous, non-resetting clock across the whole
-// gapless session, so the raw DOM value is "seconds into the session",
-// not "seconds into this track". The fix is not fancier math (no
-// performance.now(), no deltas, no local clock) - it's a per-track
-// offset: the instant the title changes, the current raw reading is
-// remembered as that track's start offset, and every following tick for
-// the same track just subtracts it from a fresh raw reading. See
-// trackStartOffset and tick() below.
+// Timing keeps the media element's subsecond precision. The visible footer
+// anchors elapsed time on startup and repairs resets or clock discontinuities.
 
 (function () {
-  if (window.__ymoverlayWatcherInstalled) return;
+  if (location.origin !== "https://music.youtube.com" || window.__ymoverlayWatcherInstalled) return;
   window.__ymoverlayWatcherInstalled = true;
+  const queueRows = new Map();
+  const queueRowIds = new WeakMap();
+  let nextQueueId = 0;
+  let ready = false;
+  let lastPlaylistsSig = "";
 
   // Shared helpers reused by later one-shot scripts (ytmBridge.js actions
   // like "like this track" or "add to playlist"), so those scripts stay
@@ -53,22 +50,32 @@
         ? el.checkVisibility()
         : el.offsetParent !== null;
     },
-    // SINGLE SOURCE OF TRUTH for "which queue items count, and in what
-    // order". YTM renders hidden/duplicate <ytmusic-player-queue-item>
-    // nodes (offscreen copies used for animation/measurement) alongside
-    // the real, visible rows. Every consumer - the watcher's readQueue()
-    // AND ytmBridge.js's selectQueueItem()/menu actions - MUST filter
-    // through this exact function before indexing, or their indices will
-    // silently drift apart (this is what caused the old "click row 3,
-    // track 2 plays" off-by-one bug: readQueue() filtered, selectQueueItem()
-    // didn't, so index N in the UI stopped matching raw DOM index N as
-    // soon as a hidden node sorted in earlier than N).
+    // All queue reads use the same visible rows. Actions resolve stable IDs.
     getQueueItems: function () {
       return Array.from(
         window.__ymoverlay.getQueueContainer().querySelectorAll("ytmusic-player-queue-item")
       ).filter(function (el) {
         return window.__ymoverlay.isVisible(el);
       });
+    },
+    queueItemId: function (row) {
+      const key = row.data?.videoId || [
+        row.querySelector(".song-title, .title")?.textContent,
+        row.querySelector(".byline")?.textContent,
+      ].join("\n");
+      let entry = queueRowIds.get(row);
+      if (!entry || entry.key !== key) {
+        entry = { id: String(nextQueueId++), key };
+        queueRowIds.set(row, entry);
+      }
+      queueRows.set(entry.id, row);
+      return entry.id;
+    },
+    getQueueItem: function (id) {
+      const row = queueRows.get(String(id));
+      if (!row?.isConnected || !window.__ymoverlay.getQueueItems().includes(row)
+        || window.__ymoverlay.queueItemId(row) !== String(id)) return null;
+      return row;
     },
     // Caches the queue panel's own wrapping element so getQueueItems()
     // can scope its querySelectorAll to that subtree instead of the
@@ -175,13 +182,9 @@
     // Finds the currently-open dialog/popup, if any, so menu actions can
     // be scoped to it instead of searching the entire document.
     findDialogRoot: function () {
-      return (
-        document.querySelector("ytmusic-add-to-playlist-renderer") ||
-        document.querySelector('tp-yt-paper-dialog[aria-hidden="false"]') ||
-        document.querySelector("tp-yt-paper-dialog:not([aria-hidden='true'])") ||
-        document.querySelector("tp-yt-iron-dropdown:not([aria-hidden='true'])") ||
-        document
-      );
+      return Array.from(document.querySelectorAll(
+        "ytmusic-add-to-playlist-renderer, ytmusic-menu-popup-renderer, tp-yt-paper-dialog, tp-yt-iron-dropdown"
+      )).find(window.__ymoverlay.isVisible) || document;
     },
     // LOCALE-INDEPENDENT "..." button finder. A row's overflow/more
     // button is never identifiable by its text (it has none - just an
@@ -234,6 +237,11 @@
         "savetoplaylist",
         "playlistadd",
       ];
+      const endpointItem = items.find(function (el) {
+        return el.data?.navigationEndpoint?.addToPlaylistEndpoint
+          || el.data?.icon?.iconType === "ADD_TO_PLAYLIST";
+      });
+      if (endpointItem) return endpointItem;
       function iconSignature(el) {
         const parts = [];
         Array.from(el.querySelectorAll("yt-icon, tp-yt-iron-icon, path, use")).forEach(function (n) {
@@ -288,8 +296,11 @@
     // looking at the list, which given the panel starts closed-by-user-
     // choice most of a session, cuts that cost out almost entirely.
     queuePanelOpen: true,
+    playlistsPanelOpen: false,
     setQueuePanelOpen: function (open) {
       window.__ymoverlay.queuePanelOpen = !!open;
+      lastTrackSig = "";
+      lastQueueSig = "";
       // Attach/detach the queue MutationObserver (see the QUEUE SCAN
       // SCHEDULING section further down, which defines this hook).
       if (window.__ymoverlay.onQueuePanelChange) window.__ymoverlay.onQueuePanelChange(!!open);
@@ -387,9 +398,13 @@
           return { id: e.id, index: e.index, href: e.href, title: e.title, author: e.author };
         });
     },
-    emitPlaylists: function () {
+    emitPlaylists: function (force = true) {
       try {
-        window.__TAURI__.event.emit("ytm://playlists", window.__ymoverlay.readPlaylists());
+        const playlists = window.__ymoverlay.readPlaylists();
+        const signature = JSON.stringify(playlists);
+        if (!force && signature === lastPlaylistsSig) return;
+        lastPlaylistsSig = signature;
+        window.__TAURI__.event.emitTo("overlay", "ytm://playlists", playlists);
       } catch (e) {}
     },
     // The click target inside a row's Play button. Tries the verified
@@ -494,6 +509,7 @@
       const deadline = Date.now() + 6000;
       while (Date.now() < deadline) {
         await H.wait(120);
+        if (entry.href && new URL(location.href).searchParams.get("list") !== new URL(entry.href, location.href).searchParams.get("list")) continue;
         btn = H.findPlaylistPagePlay(entry.title);
         if (btn) break;
       }
@@ -502,10 +518,11 @@
         return false;
       }
       btn.click();
+      const playlistHref = location.href;
       if (H.returnAfterSequential && location.href !== startHref) {
         await H.wait(1000); // let the queue start before leaving the page
         try {
-          history.back();
+          if (location.href === playlistHref) history.back();
         } catch (e) {}
       }
       return true;
@@ -567,18 +584,90 @@
       }
     },
   };
-  // NOTE: trackStartOffset (defined further down, used by tick() to turn
-  // the session-wide raw clock into a track-relative elapsed reading) is
-  // intentionally NOT exposed here for seekTo() to consume. It's only
-  // ever updated once a second, on the watcher's own poll, so by the
-  // time a one-shot ytm_eval() call reads it days/moments later it can
-  // already be stale relative to the exact instant of the seek - and
-  // reconstructing an absolute "session time" target from a stale anchor
-  // is exactly what was landing seeks in the wrong track. seekTo()
-  // instead computes a RELATIVE delta against a fresh video.currentTime
-  // read in the same call, the same way skip() already does reliably -
-  // see ytmBridge.js.
+  const playlistChoices = new Map();
+  let playlistPickerSession = 0;
 
+  function playlistPicker() {
+    return Array.from(document.querySelectorAll("ytmusic-add-to-playlist-renderer"))
+      .find(window.__ymoverlay.isVisible);
+  }
+
+  async function waitForPlaylistElement(find, session) {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      if (session !== playlistPickerSession) throw new Error("Playlist selection cancelled.");
+      const element = find();
+      if (element) return element;
+      await window.__ymoverlay.wait(150);
+    }
+    throw new Error("YouTube Music's playlist picker did not load. Please try again.");
+  }
+
+  function pickerOptions(root) {
+    const choices = new Map();
+    root.querySelectorAll("ytmusic-playlist-add-to-option-renderer, ytmusic-two-row-item-renderer")
+      .forEach(function (row) {
+        const data = row.data || {};
+        const edit = data.navigationEndpoint?.playlistEditEndpoint;
+        const id = data.playlistId || (edit?.actions?.some((action) => action.action === "ACTION_ADD_VIDEO") && edit.playlistId);
+        const label = (data.title?.runs || []).map((run) => run.text || "").join("")
+          || data.title?.simpleText
+          || row.querySelector("#title, .title")?.textContent.trim();
+        if (!id || !label || !window.__ymoverlay.isVisible(row)) return;
+        const subtitle = row.querySelector(".byline, .subtitle")?.textContent.trim() || "";
+        // Prefer the full list over its duplicate card in the Recent shelf.
+        if (choices.get(id)?.row.localName === "ytmusic-playlist-add-to-option-renderer") return;
+        choices.set(id, { id, label, subtitle, row, root });
+      });
+    return choices;
+  }
+
+  window.__ymoverlay.openPlaylistPicker = async function (index) {
+    const session = ++playlistPickerSession;
+    playlistChoices.clear();
+    const emit = (name, payload) => window.__TAURI__.event.emitTo("overlay", `ytm://${name}`, payload);
+    try {
+      emit("error", "");
+      const row = window.__ymoverlay.getQueueItem(index);
+      const button = row && window.__ymoverlay.findRowMenuButton(row);
+      if (!button) throw new Error("This track is no longer available in the YouTube Music queue.");
+      playlistPicker()?.querySelector(".close-icon button")?.click();
+      button.click();
+      const item = await waitForPlaylistElement(() => window.__ymoverlay.findAddToPlaylistMenuItem(
+        window.__ymoverlay.findDialogRoot()), session);
+      (item.querySelector("a#navigation-endpoint") || item).click();
+      const choices = await waitForPlaylistElement(() => {
+        const root = playlistPicker();
+        if (!root) return null;
+        const options = pickerOptions(root);
+        return options.size ? options : null;
+      }, session);
+      choices.forEach((option, id) => playlistChoices.set(id, option));
+      emit("add-to-playlist-options", { index, options: Array.from(choices.values(),
+        ({ id, label, subtitle }) => ({ id, label, subtitle })) });
+    } catch (error) {
+      if (session !== playlistPickerSession) return;
+      emit("error", error.message);
+      emit("add-to-playlist-options", { index, options: [] });
+    }
+  };
+
+  window.__ymoverlay.confirmPlaylistChoice = function (id) {
+    try {
+      const choice = playlistChoices.get(id);
+      if (!choice?.row.isConnected || choice.root !== playlistPicker()
+        || pickerOptions(choice.root).get(id)?.row !== choice.row) throw new Error("The playlist picker has closed or changed. Please open it again.");
+      const button = choice.row.querySelector("button, a.image-wrapper");
+      if (!button) throw new Error("YouTube Music's playlist button is unavailable.");
+      button.click();
+      playlistChoices.clear();
+    } catch (error) { window.__TAURI__.event.emitTo("overlay", "ytm://error", error.message); }
+  };
+
+  window.__ymoverlay.cancelPlaylistChoice = function () {
+    playlistPickerSession++;
+    playlistChoices.clear();
+    playlistPicker()?.querySelector(".close-icon button")?.click();
+  };
   // -----------------------------------------------------------------
   // Volume enforcement.
   //
@@ -672,6 +761,7 @@
   function watchVideoElement() {
     const video = document.querySelector("video");
     if (video && video !== lastVolumeWatchedVideo) {
+      lastVolumeWatchedVideo?.removeEventListener("volumechange", applyTargetVolume);
       lastVolumeWatchedVideo = video;
       try {
         // Native event, fires synchronously on ANY assignment to
@@ -712,7 +802,7 @@
     true
   );
 
-  // Independent of the 500ms UI tick, and deliberately tight - the reset
+  // Independent of the 1-second UI tick, and deliberately tight - the reset
   // this guards against isn't tied to our tick cadence, and the goal is
   // for a drift to be corrected within a couple hundred ms, not be
   // audible. Gated to actual playback: paused audio can't audibly drift,
@@ -796,11 +886,13 @@
   function readTick() {
     const video = document.querySelector("video");
     const rawDuration = video && isFinite(video.duration) ? video.duration : 0;
+    const footer = textOf(barField("time", ".time-info")).split("/");
     return {
       isPlaying: video ? !video.paused : false,
       currentTime: video ? video.currentTime : 0,
+      footerElapsed: footer.length === 2 ? parseTimeToSeconds(footer[0]) : null,
       duration: readFooterDuration(rawDuration),
-      volume: video ? video.volume : 1,
+      volume: video ? video.volume : null,
     };
   }
 
@@ -847,12 +939,6 @@
 
   function readQueue() {
     try {
-      // TRUE indices into this array are what ytmBridge.js's
-      // selectQueueItem()/addQueueItemToPlaylist() index against (they
-      // call getQueueItems() fresh themselves) - so every emitted row's `id` below must stay the row's real position HERE,
-      // never a position renumbered after windowing/slicing, or clicks
-      // land on the wrong track (the exact "off-by-one" class of bug
-      // getQueueItems()'s own filtering was written to prevent).
       const rawItems = window.__ymoverlay.getQueueItems();
 
       const activeIndex = rawItems.findIndex(
@@ -898,12 +984,12 @@
       // (usually data-URL-sized) string in queueSig's comparison and in
       // the payload sent across the Tauri IPC bridge. Skipping it here is
       // what actually removes the cost, not just hiding the <img> in CSS.
-      return pooled.slice(sliceStart, sliceEnd).map((el, i) => {
-        const trueIndex = windowStart + sliceStart + i;
+      queueRows.clear();
+      return pooled.slice(sliceStart, sliceEnd).map((el) => {
         const titleEl = window.__ymoverlay.firstVisible(el, ".song-title, .title");
         const bylineEl = window.__ymoverlay.firstVisible(el, ".byline");
         return {
-          id: String(trueIndex),
+          id: window.__ymoverlay.queueItemId(el),
           title: textOf(titleEl) || "Unknown title",
           artist: textOf(bylineEl).split("•")[0].trim(),
           active:
@@ -925,25 +1011,26 @@
   let lastTrackKey = "";
   let lastQueueSig = "";
 
-  // ROOT CAUSE of the "previous song's seconds bleed into the next one"
-  // bug: YTM does NOT reset <video>.currentTime to 0 at the start of each
-  // queued track - it runs one continuous, non-resetting clock on the
-  // element across the whole gapless session (readTick()'s currentTime
-  // keeps climbing straight through a track change). So the DOM's raw
-  // currentTime is NOT "seconds into this track" - it's "seconds into
-  // the whole session". Trusting it directly (even just resetting the
-  // DISPLAY to 0 for one tick and relaying the raw value again on the
-  // next) is exactly what caused the timer to jump back up to the
-  // accumulated total a tick after the reset.
-  //
-  // FIX: don't display the raw value at all. The instant a new track is
-  // detected, remember the raw currentTime AT THAT MOMENT as this
-  // track's start offset. Every following tick for that same track
-  // subtracts that offset from the fresh raw reading to get seconds
-  // elapsed IN THIS TRACK. This is still a single fresh DOM read per
-  // tick with one subtraction - not a local clock, not an accumulating
-  // delta - it's just "where did THIS song start counting from".
+  // Offset between the media clock and the footer clock.
   let trackStartOffset = 0;
+
+  function trackElapsed(raw) {
+    let elapsed = raw.currentTime - trackStartOffset;
+    // Recover after reload, repeat or replacement of the media element.
+    // Keep subsecond precision; the footer itself is rounded to seconds.
+    if (raw.footerElapsed !== null && Math.abs(elapsed - raw.footerElapsed) > 1.5) {
+      trackStartOffset = raw.currentTime - raw.footerElapsed;
+      elapsed = raw.footerElapsed;
+    }
+    return Math.max(0, elapsed);
+  }
+
+  window.__ymoverlay.seekTo = function (target) {
+    const video = document.querySelector("video");
+    if (!video || !Number.isFinite(target)) return;
+    const raw = readTick();
+    video.currentTime = Math.max(0, raw.currentTime + target - trackElapsed(raw));
+  };
 
   // -----------------------------------------------------------------
   // TRACK DESYNC FIX: the 1-second poll below is normally enough on its
@@ -969,6 +1056,7 @@
   // instead of guessing when to sample next.
   // -----------------------------------------------------------------
   let trackObserverTarget = null;
+  let trackObserver = null;
   let trackObserverScheduled = false;
   // The ONLY thing in the bar that mutates every second is the
   // "0:16 / 2:57" text. It can never change which track is playing, so
@@ -982,8 +1070,9 @@
   function ensureTrackObserver() {
     const bar = getPlayerBar();
     if (!bar || bar === trackObserverTarget) return;
+    trackObserver?.disconnect();
     trackObserverTarget = bar;
-    const observer = new MutationObserver(function (records) {
+    trackObserver = new MutationObserver(function (records) {
       const __diagStart = window.__ymoverlay._diag ? nowMs() : 0;
       let relevant = false;
       for (let i = 0; i < records.length; i++) {
@@ -1013,7 +1102,7 @@
     // Polymer can swap the title/byline nodes for new ones, and an
     // observer pinned to the old node would go silent - the exact
     // desync this observer exists to fix.
-    observer.observe(bar, { childList: true, subtree: true, characterData: true });
+    trackObserver.observe(bar, { childList: true, subtree: true, characterData: true });
   }
 
   // --- track + timer, read together and gated as one unit -------------
@@ -1036,14 +1125,12 @@
 
       if (trackKey !== lastTrackKey) {
         const raw = readTick(); // isPlaying/currentTime(raw)/duration/volume
-        // New song. Anchor here - whatever the player's own (continuous)
-        // clock reads right now becomes "0" for this track - and forcibly
-        // report 0, never any part of the previous track's elapsed time.
+        // Preserve elapsed time when attaching to an already playing song.
         lastTrackKey = trackKey;
-        trackStartOffset = raw.currentTime;
-        window.__TAURI__.event.emit("ytm://tick", {
+        trackStartOffset = raw.currentTime - (raw.footerElapsed ?? 0);
+        window.__TAURI__.event.emitTo("overlay", "ytm://tick", {
           isPlaying: raw.isPlaying,
-          currentTime: 0,
+          currentTime: trackElapsed(raw),
           duration: raw.duration,
           volume: raw.volume,
         });
@@ -1054,8 +1141,8 @@
         // Math.max guards the rare tick where raw briefly dips below the
         // offset (e.g. a buffering hiccup) so the display never goes
         // negative.
-        const elapsed = Math.max(0, raw.currentTime - trackStartOffset);
-        window.__TAURI__.event.emit("ytm://tick", {
+        const elapsed = trackElapsed(raw);
+        window.__TAURI__.event.emitTo("overlay", "ytm://tick", {
           isPlaying: raw.isPlaying,
           currentTime: elapsed,
           duration: raw.duration,
@@ -1066,7 +1153,7 @@
       const trackSig = trackKey + "|" + track.art;
       if (trackSig !== lastTrackSig) {
         lastTrackSig = trackSig;
-        window.__TAURI__.event.emit("ytm://track", track);
+        window.__TAURI__.event.emitTo("overlay", "ytm://track", track);
       }
     } catch (e) {
       /* DOM not ready yet - ignore, retry next tick */
@@ -1117,12 +1204,10 @@
       }
       const backoff = elapsed > 80 ? Math.min(10, Math.ceil(elapsed / 80)) * 1000 : 0;
       queueNextAllowedAt = nowMs() + Math.max(QUEUE_MIN_INTERVAL_MS, backoff);
-      const queueSig = queue
-        .map((t) => t.id + t.title + t.active)
-        .join(";");
+      const queueSig = JSON.stringify(queue);
       if (queueSig !== lastQueueSig) {
         lastQueueSig = queueSig;
-        window.__TAURI__.event.emit("ytm://queue", queue);
+        window.__TAURI__.event.emitTo("overlay", "ytm://queue", queue);
       }
     } catch (e) {
       /* queue panel DOM not ready - ignore */
@@ -1191,6 +1276,11 @@
 
   let tickCount = 0;
   function tick() {
+    if (!window.__TAURI__?.event) return;
+    if (!ready) {
+      ready = true;
+      window.__TAURI__.event.emitTo("overlay", "ytm://ready", null);
+    }
     const diag = window.__ymoverlay._diag;
     let t0 = diag ? nowMs() : 0;
 
@@ -1217,6 +1307,9 @@
       }
       if (window.__ymoverlay.queuePanelOpen !== false && tickCount % QUEUE_SAFETY_TICKS === 0) {
         scheduleQueueRead(false);
+      }
+      if (window.__ymoverlay.playlistsPanelOpen && tickCount % QUEUE_SAFETY_TICKS === 0) {
+        window.__ymoverlay.emitPlaylists(false);
       }
     } catch (e) {
       /* queue DOM not ready - ignore */
@@ -1258,10 +1351,7 @@
     console.log("[ymoverlay] diagnostics on");
   };
 
-  // Classic 1-second poll. No performance.now(), no local clock, no
-  // running total we add to ourselves - each tick just reads the DOM
-  // fresh and subtracts a fixed per-track offset. See ROOT CAUSE note
-  // above tick().
+  // Mutation observers provide fast updates; polling is the fallback.
   setInterval(tick, 1000);
   tick();
 })();

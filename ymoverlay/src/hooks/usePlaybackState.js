@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import * as ytm from "../lib/ytmBridge.js";
+import * as youtube from "../lib/ytmBridge.js";
+import * as spotify from "../lib/spotifyBridge.js";
 import { isScrolling, onScrollIdle } from "../lib/scrollGate.js";
 
 const PLACEHOLDER_ART =
-  "https://placehold.co/96x96/1a1f2b/8891a5?text=%E2%99%AB";
+  `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" fill="#1a1f2b"/><text x="48" y="63" text-anchor="middle" font-size="48" fill="#8891a5">♫</text></svg>')}`;
 
 const EMPTY_TRACK = {
   title: "Nothing playing",
@@ -18,7 +19,7 @@ const EMPTY_TRACK = {
 // since the panel area itself is a fixed-height scroll region either way
 // (see App.jsx) - this keeps the resize logic simple and deterministic.
 // Tune these two numbers if you change padding/font sizes in App.jsx.
-const WINDOW_WIDTH = 360;
+const WINDOW_WIDTH = 424;
 const COLLAPSED_HEIGHT = 380;
 const EXPANDED_HEIGHT = 620;
 // Must match the CSS transition duration on the collapsing panel in
@@ -102,7 +103,9 @@ async function resizeWindow(height) {
 // than guessing.
 const INITIAL_PINNED = true;
 
-export function usePlaybackState() {
+export function usePlaybackState(provider = "ytm") {
+  const ytm = provider === "spotify" ? spotify : youtube;
+  const [playbackError, setPlaybackError] = useState("");
   const [track, setTrack] = useState(EMPTY_TRACK);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -122,11 +125,22 @@ export function usePlaybackState() {
   // every queue tick, right as the user is scrolling/clicking it.
   const queueRef = useRef([]);
   const [isPinned, setIsPinned] = useState(INITIAL_PINNED);
+  const pinBusy = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    getCurrentWindow().isAlwaysOnTop().then((pinned) => {
+      if (active) setIsPinned(pinned);
+    }).catch(console.error);
+    return () => { active = false; };
+  }, []);
 
   // "closed" | "queue" | "playlists" - mutually exclusive, drives both the
   // collapsible panel content and the native window height. Starts open
   // to match the window's initial height in tauri.conf.json.
   const [panelMode, setPanelMode] = useState("queue");
+  const panelModeRef = useRef(panelMode);
+  panelModeRef.current = panelMode;
 
   const [playlists, setPlaylists] = useState([]);
   const [playlistsLoading, setPlaylistsLoading] = useState(false);
@@ -141,6 +155,8 @@ export function usePlaybackState() {
   // While the user is actively dragging the scrub bar, ignore incoming
   // currentTime updates so the thumb doesn't jump under their finger.
   const isScrubbing = useRef(false);
+  const seekPending = useRef(false);
+  const seekTimer = useRef(null);
 
   // The volume the user actually wants, as opposed to whatever the page
   // happens to report. Some players reset <video>.volume to 1 on a track
@@ -150,40 +166,49 @@ export function usePlaybackState() {
   const desiredVolumeRef = useRef(persistedVolumeOnMount.current ?? 100);
   const hasSyncedInitialVolume = useRef(persistedVolumeOnMount.current !== null);
 
-  // The last CONFIRMED elapsed-in-track reading, straight from the watcher
-  // - always kept up to date, even while isScrubbing suppresses the visible
-  // currentTime state. commitSeek needs this rather than the `currentTime`
-  // state: while dragging, `currentTime` has already been overwritten with
-  // the user's in-progress preview position (see seek() below), so by the
-  // time a tap/release fires it no longer reflects where playback actually
-  // is - only this ref still does.
-  const lastKnownElapsedRef = useRef(0);
-
-  // Anchor for the local progress-bar interpolator below: the last
-  // (elapsed-in-track, wall-clock-when-we-learned-it) pair we actually
-  // trust, from either a real ytm://tick or one of our own optimistic
-  // updates (skip/seek). Deliberately separate from lastKnownElapsedRef,
-  // which only ever holds CONFIRMED values - this one is allowed to hold
-  // an optimistic guess too, since the interpolator's job is to look
-  // smooth, not to be a second source of truth.
+  // Last confirmed or optimistic position for local interpolation.
   const tickAnchorRef = useRef({ value: 0, wallClockMs: Date.now() });
 
   useEffect(() => {
-    if (persistedVolumeOnMount.current !== null) {
-      // We already know what the user wants - push it immediately rather
-      // than waiting for/trusting whatever the page itself currently
-      // reports (which is exactly the ytm://tick first-sync branch below,
-      // deliberately skipped in this case since hasSyncedInitialVolume
-      // already starts true). ytm.setVolume routes through the page's
-      // own continuously-enforced target, so this is safe to fire even
-      // before the hidden window has fully finished loading.
-      ytm.setVolume(persistedVolumeOnMount.current);
-    }
-  }, []);
+    setTrack({ ...EMPTY_TRACK, artist: `Open ${provider === "ytm" ? "YouTube Music" : "Spotify"} to begin` });
+    setPlaybackError("");
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setQueue([]);
+    queueRef.current = [];
+    setPlaylists([]);
+    playlistsRef.current = [];
+    setPlaylistsLoading(false);
+    setAddToPlaylistPrompt(null);
+    isScrubbing.current = false;
+    seekPending.current = false;
+    clearTimeout(seekTimer.current);
+    tickAnchorRef.current = { value: 0, wallClockMs: Date.now() };
+    return () => clearTimeout(seekTimer.current);
+  }, [provider]);
 
   useEffect(() => {
+    if (hasSyncedInitialVolume.current) {
+      // Restore the latest choice, including changes made since startup.
+      ytm.setVolume(desiredVolumeRef.current);
+    }
+  }, [provider]);
+
+  useEffect(() => {
+    let active = true;
     let pendingQueue = null;
     let pendingPlaylists = null;
+    function syncPlayer() {
+      if (!active) return;
+      ytm.setQueuePanelOpen(panelModeRef.current === "queue");
+      ytm.setPlaylistsPanelOpen?.(panelModeRef.current === "playlists");
+      if (panelModeRef.current === "playlists") ytm.fetchPlaylists();
+      if (hasSyncedInitialVolume.current) ytm.setVolume(desiredVolumeRef.current);
+    }
+    const subscribe = (name, handler) => listen(`${provider}://${name}`, (event) => {
+      if (active) handler(event);
+    });
 
     function applyQueue(items) {
       // mergeList returns the SAME array when nothing changed, so both the
@@ -212,11 +237,18 @@ export function usePlaybackState() {
     });
 
     const unlisten = [
-      listen("ytm://tick", (event) => {
+      subscribe("ready", syncPlayer),
+      subscribe("error", (event) => {
+        setPlaybackError(event.payload);
+        if (event.payload) {
+          setAddToPlaylistPrompt(null);
+          setPlaylistsLoading(false);
+        }
+      }),
+      subscribe("tick", (event) => {
         const s = event.payload;
         setIsPlaying(!!s.isPlaying);
         setDuration(s.duration || 0);
-        lastKnownElapsedRef.current = s.currentTime || 0;
         tickAnchorRef.current = { value: s.currentTime || 0, wallClockMs: Date.now() };
         if (!isScrubbing.current) {
           setCurrentTime(s.currentTime || 0);
@@ -225,7 +257,7 @@ export function usePlaybackState() {
         // after that we drive volume ourselves (see setVolume and the
         // ytm://track handler below), so a mid-song or track-change
         // reset on the page's side doesn't fight the user's chosen level.
-        if (!hasSyncedInitialVolume.current) {
+        if (!hasSyncedInitialVolume.current && Number.isFinite(s.volume)) {
           const initial = Math.round((s.volume ?? 1) * 100);
           setVolumeState(initial);
           desiredVolumeRef.current = initial;
@@ -241,7 +273,7 @@ export function usePlaybackState() {
           persistVolume(initial);
         }
       }),
-      listen("ytm://track", (event) => {
+      subscribe("track", (event) => {
         const s = event.payload;
         setTrack({
           title: s.title || EMPTY_TRACK.title,
@@ -254,9 +286,7 @@ export function usePlaybackState() {
           ytm.setVolume(desiredVolumeRef.current);
         }
       }),
-      listen("ytm://queue", (event) => {
-        // Queue rows are text-only (title/artist) - no art on this payload
-        // at all anymore, see ytm-watcher.js's readQueue().
+      subscribe("queue", (event) => {
         const items = Array.isArray(event.payload) ? event.payload : [];
         // Never swap rows under the user's finger: while a list is being
         // scrolled, only remember the newest payload; it is applied by
@@ -267,7 +297,7 @@ export function usePlaybackState() {
         }
         applyQueue(items);
       }),
-      listen("ytm://playlists", (event) => {
+      subscribe("playlists", (event) => {
         const items = Array.isArray(event.payload) ? event.payload : [];
         if (isScrolling()) {
           pendingPlaylists = items;
@@ -275,16 +305,21 @@ export function usePlaybackState() {
         }
         applyPlaylists(items);
       }),
-      listen("ytm://add-to-playlist-options", (event) => {
-        setAddToPlaylistPrompt(event.payload);
+      subscribe("add-to-playlist-options", (event) => {
+        setAddToPlaylistPrompt((prompt) => prompt && prompt.index === event.payload.index
+          ? event.payload : prompt);
       }),
     ];
+    Promise.all(unlisten).then(syncPlayer).catch((error) => {
+      if (active) setPlaybackError(String(error));
+    });
 
     return () => {
+      active = false;
       offScrollIdle();
-      unlisten.forEach((p) => p.then((fn) => fn()));
+      unlisten.forEach((p) => p.then((fn) => fn()).catch(console.error));
     };
-  }, []);
+  }, [provider]);
 
   // --- transport -------------------------------------------------------
 
@@ -296,6 +331,24 @@ export function usePlaybackState() {
   // has to be trusted alone for longer than the first render.
   useEffect(() => {
     ytm.setQueuePanelOpen(panelMode === "queue");
+    ytm.setPlaylistsPanelOpen?.(panelMode === "playlists");
+    if (panelMode === "playlists") {
+      if (playlistsRef.current.length === 0) setPlaylistsLoading(true);
+      ytm.fetchPlaylists();
+    }
+    if (panelMode !== "queue") {
+      ytm.cancelAddToPlaylist?.();
+      setAddToPlaylistPrompt(null);
+    }
+  }, [panelMode, provider]);
+
+  useEffect(() => {
+    if (panelMode !== "closed") {
+      resizeWindow(EXPANDED_HEIGHT);
+      return;
+    }
+    const timer = setTimeout(() => resizeWindow(COLLAPSED_HEIGHT), PANEL_TRANSITION_MS);
+    return () => clearTimeout(timer);
   }, [panelMode]);
 
   // Local progress-bar interpolation. ytm://tick normally arrives ~once a
@@ -333,10 +386,10 @@ export function usePlaybackState() {
   const togglePlay = useCallback(() => {
     setIsPlaying((p) => !p); // optimistic; next tick confirms/corrects
     ytm.togglePlay();
-  }, []);
+  }, [ytm]);
 
-  const next = useCallback(() => ytm.next(), []);
-  const prev = useCallback(() => ytm.prev(), []);
+  const next = useCallback(() => ytm.next(), [ytm]);
+  const prev = useCallback(() => ytm.prev(), [ytm]);
 
   const skipForward15 = useCallback(() => {
     setCurrentTime((t) => {
@@ -345,7 +398,7 @@ export function usePlaybackState() {
       return next;
     });
     ytm.skip(15);
-  }, [duration]);
+  }, [duration, ytm]);
 
   const skipBack15 = useCallback(() => {
     setCurrentTime((t) => {
@@ -354,57 +407,57 @@ export function usePlaybackState() {
       return next;
     });
     ytm.skip(-15);
-  }, []);
+  }, [ytm]);
 
   const seek = useCallback(
     (value) => {
+      if (!Number.isFinite(value) || duration <= 0) return;
+      clearTimeout(seekTimer.current);
+      seekPending.current = true;
       isScrubbing.current = true;
-      setCurrentTime(value * duration);
+      setCurrentTime(Math.max(0, Math.min(1, value)) * duration);
     },
     [duration]
   );
 
-  // How much short of the track's own end a seek is allowed to land.
-  // ytm.seekTo() works by adding the watcher's trackStartOffset (the
-  // session-clock reading captured at the moment it POLLED and noticed
-  // the title change - see ytm-watcher.js) to a track-relative target.
-  // That poll runs once a second, so the offset can be stamped up to
-  // ~1s late: the new track's audio may already have been playing for
-  // a moment before the watcher catches up and anchors it. That's
-  // invisible for a mid-song seek, but a target close enough to "the
-  // end" can, once that slop is folded in, cross into the next track's
-  // slice of YTM's one continuous session clock - which YTM reads as
-  // "this track just finished" and auto-advances immediately, even
-  // though the duration we display (read independently from the
-  // footer) was correct. Keeping every seek at least this far from the
-  // computed end keeps it clear of that slop without giving up any
-  // scrubbing range that matters in practice.
+  // Avoid accidentally advancing to the next song on an end-of-track seek.
   const SEEK_END_SAFETY_MARGIN_SECONDS = 1.2;
 
   const commitSeek = useCallback(
     (value) => {
+      if (!seekPending.current) return;
+      seekPending.current = false;
       const requested = value * duration;
       const latestSafe = Math.max(0, duration - SEEK_END_SAFETY_MARGIN_SECONDS);
-      const target = Math.min(requested, latestSafe);
+      const target = Math.max(0, Math.min(requested, latestSafe));
       tickAnchorRef.current = { value: target, wallClockMs: Date.now() };
-      ytm.seekTo(target, lastKnownElapsedRef.current);
-      setTimeout(() => {
+      setCurrentTime(target);
+      ytm.seekTo(target);
+      clearTimeout(seekTimer.current);
+      seekTimer.current = setTimeout(() => {
         isScrubbing.current = false;
       }, 400);
     },
-    [duration]
+    [duration, ytm]
   );
 
   const setVolume = useCallback((percent) => {
+    if (!Number.isFinite(percent)) return;
+    percent = Math.max(0, Math.min(100, Math.round(percent)));
+    hasSyncedInitialVolume.current = true;
     desiredVolumeRef.current = percent;
     setVolumeState(percent); // optimistic
     ytm.setVolume(percent);
     persistVolume(percent);
-  }, []);
+  }, [ytm]);
 
   // --- queue -------------------------------------------------------------
 
   const selectTrack = useCallback((id) => {
+    if (ytm === spotify) {
+      ytm.selectQueueItem(Number(id));
+      return;
+    }
     // Reads from the ref, not the `queue` state, so this callback's own
     // identity never changes - see queueRef's comment above. Passed down
     // as QueueRow's onSelect, a stable reference is what lets
@@ -421,7 +474,7 @@ export function usePlaybackState() {
     // (see ytm-watcher.js's readQueue()), so keep whatever art is
     // currently showing until the real "ytm://track" event - carrying
     // the actual full-res art - lands a moment later.
-    setTrack((t) => ({ ...t, title: clicked.title, artist: clicked.artist }));
+    setTrack((t) => ({ ...t, title: clicked.title, artist: clicked.artist, art: clicked.art || t.art }));
     // Only touch the two rows whose `active` flag actually changes (the
     // previously active one, and this one) - every other row keeps its
     // exact same object reference, so React.memo bails out on it
@@ -435,84 +488,58 @@ export function usePlaybackState() {
       return next;
     });
     ytm.selectQueueItem(Number(id));
-  }, []);
+  }, [ytm]);
 
   const startAddToPlaylist = useCallback((id) => {
     setAddToPlaylistPrompt({ index: Number(id), options: [], loading: true });
     ytm.addQueueItemToPlaylist(Number(id));
-  }, []);
+  }, [ytm]);
 
   const confirmAddToPlaylist = useCallback((label) => {
     ytm.confirmAddToPlaylist(label);
     setAddToPlaylistPrompt(null);
-  }, []);
+  }, [ytm]);
 
   const cancelAddToPlaylist = useCallback(() => {
+    ytm.cancelAddToPlaylist?.();
     setAddToPlaylistPrompt(null);
-  }, []);
+  }, [ytm]);
 
   // --- panel (queue list / playlists) + window resize --------------------
 
   const closePanel = useCallback(() => {
     setPanelMode("closed");
-    setTimeout(() => resizeWindow(COLLAPSED_HEIGHT), PANEL_TRANSITION_MS);
   }, []);
 
   const toggleQueuePanel = useCallback(() => {
-    setPanelMode((mode) => {
-      if (mode === "queue") {
-        setTimeout(() => resizeWindow(COLLAPSED_HEIGHT), PANEL_TRANSITION_MS);
-        return "closed";
-      }
-      resizeWindow(EXPANDED_HEIGHT); // grow first so there's room to animate into
-      return "queue";
-    });
+    setPanelMode((mode) => mode === "queue" ? "closed" : "queue");
   }, []);
 
   const togglePlaylistsPanel = useCallback(() => {
-    setPanelMode((mode) => {
-      if (mode === "playlists") {
-        setTimeout(() => resizeWindow(COLLAPSED_HEIGHT), PANEL_TRANSITION_MS);
-        return "closed";
-      }
-      resizeWindow(EXPANDED_HEIGHT);
-      if (mode !== "playlists") {
-        // Already loaded once? Keep showing it and refresh silently in the
-        // background (applyPlaylists merges, so an unchanged list is a
-        // no-op). The "Loading..." placeholder only appears the very first
-        // time - it used to blank and rebuild the whole list on every open.
-        if (playlistsRef.current.length === 0) setPlaylistsLoading(true);
-        ytm.fetchPlaylists();
-      }
-      return "playlists";
-    });
+    setPanelMode((mode) => mode === "playlists" ? "closed" : "playlists");
   }, []);
 
   const playPlaylist = useCallback((playlist, opts) => {
     ytm.playPlaylist(playlist, opts);
-  }, []);
+  }, [ytm]);
 
   // --- pin (always-on-top) -----------------------------------------------
 
   const togglePin = useCallback(() => {
-    setIsPinned((pinned) => {
-      const next = !pinned;
-      // Optimistic, same pattern as togglePlay/setVolume above - flip the
-      // button's own state immediately rather than waiting on a round trip,
-      // and let the try/catch below just be a no-op outside Tauri (e.g.
-      // plain `vite dev` in a browser tab).
-      getCurrentWindow()
-        .setAlwaysOnTop(next)
-        .catch(() => {
-          // Non-fatal - see resizeWindow's comment above for why.
-        });
-      return next;
-    });
-  }, []);
+    if (pinBusy.current) return;
+    pinBusy.current = true;
+    const next = !isPinned;
+    setIsPinned(next);
+    getCurrentWindow().setAlwaysOnTop(next).catch((error) => {
+      setIsPinned(!next);
+      setPlaybackError(String(error));
+    }).finally(() => { pinBusy.current = false; });
+  }, [isPinned]);
 
   return {
     isPlaying,
-    progress: duration > 0 ? currentTime / duration : 0,
+    progress: duration > 0 ? Math.max(0, Math.min(1, currentTime / duration)) : 0,
+    playbackError,
     current: {
       ...track,
       elapsed: formatTime(currentTime),

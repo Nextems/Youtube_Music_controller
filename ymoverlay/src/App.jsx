@@ -1,9 +1,13 @@
-import { ChevronUp, ChevronDown, ListMusic, Pin, PinOff } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { ChevronUp, ChevronDown, ListMusic, Monitor, Pin, PinOff } from "lucide-react";
 import { usePlaybackState, PANEL_TRANSITION_MS } from "./hooks/usePlaybackState.js";
 import TransportControls from "./components/TransportControls.jsx";
 import ProgressBar from "./components/ProgressBar.jsx";
 import QueueList from "./components/QueueList.jsx";
 import PlaylistsPanel from "./components/PlaylistsPanel.jsx";
+import ServiceSwitcher from "./components/ServiceSwitcher.jsx";
 
 // Matches the fixed max-h-56 (14rem) scroll area used inside QueueList /
 // PlaylistsPanel - keeping this one source of truth so the collapsing
@@ -11,8 +15,64 @@ import PlaylistsPanel from "./components/PlaylistsPanel.jsx";
 const PANEL_HEIGHT_PX = 224;
 
 export default function App() {
+  const [provider, setProvider] = useState("ytm");
+  const [playerError, setPlayerError] = useState("");
+  const [musicVisible, setMusicVisible] = useState(true);
+  const [musicToggling, setMusicToggling] = useState(true);
+  const playerBusy = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    invoke("get_player_state").then(([currentProvider, visible]) => {
+      if (!active) return;
+      setProvider(currentProvider);
+      setMusicVisible(visible);
+    }).catch((error) => {
+      if (active) setPlayerError(String(error));
+    }).finally(() => {
+      if (active) setMusicToggling(false);
+    });
+    const off = listen("player://visibility", (event) => setMusicVisible(event.payload));
+    return () => {
+      active = false;
+      off.then((unlisten) => unlisten()).catch(console.error);
+    };
+  }, []);
+
+  async function selectPlayer(next) {
+    if (playerBusy.current) return;
+    playerBusy.current = true;
+    setMusicToggling(true);
+    setPlayerError("");
+    try {
+      setMusicVisible(await invoke("select_player", { provider: next }));
+      setProvider(next);
+    } catch (error) {
+      setPlayerError(String(error));
+    } finally {
+      playerBusy.current = false;
+      setMusicToggling(false);
+    }
+  }
+
+  async function toggleMusicWindow() {
+    if (playerBusy.current) return;
+    playerBusy.current = true;
+    setMusicToggling(true);
+    setPlayerError("");
+    try {
+      setMusicVisible(await invoke("toggle_music_window"));
+    } catch (error) {
+      setPlayerError(String(error));
+    } finally {
+      playerBusy.current = false;
+      setMusicToggling(false);
+    }
+  }
+
   const {
     isPlaying,
+    playbackError,
     progress,
     current,
     volume,
@@ -38,12 +98,13 @@ export default function App() {
     playPlaylist,
     isPinned,
     togglePin,
-  } = usePlaybackState();
+  } = usePlaybackState(provider);
 
   const panelOpen = panelMode !== "closed";
 
   return (
-    <div data-tauri-drag-region className="relative h-screen w-screen flex items-start justify-center bg-transparent pt-2.5">
+    <div data-tauri-drag-region className="relative h-screen w-screen flex items-start justify-end bg-transparent pt-2.5 pr-2.5">
+      <ServiceSwitcher provider={provider} disabled={musicToggling} onSelect={selectPlayer} />
       {/* WINDOW DRAGGING = data-tauri-drag-region (a JS mousedown ->
           startDragging), NOT CSS `-webkit-app-region`. The CSS version
           made Chromium track every drag/no-drag rect of the page and hand
@@ -73,6 +134,21 @@ export default function App() {
       <div data-tauri-drag-region className="absolute left-0 inset-y-0 w-2 cursor-move" />
       <div data-tauri-drag-region className="absolute right-0 inset-y-0 w-2 cursor-move" />
 
+      <button
+        type="button"
+        aria-label={`${musicVisible ? "Hide" : "Show"} ${provider === "ytm" ? "YouTube Music" : "Spotify"} window`}
+        aria-pressed={musicVisible}
+        title={`${musicVisible ? "Hide" : "Show"} ${provider === "ytm" ? "YouTube Music" : "Spotify"}`}
+        disabled={musicToggling}
+        onClick={toggleMusicWindow}
+        style={{ top: 18, left: 82 }}
+        className={`absolute z-40 p-1 rounded-md transition-colors hover:bg-white/10 ${
+          musicVisible ? "text-orange-400 hover:text-orange-300" : "text-slate-500 hover:text-slate-200"
+        }`}
+      >
+        <Monitor size={15} />
+      </button>
+
       {/* Pin / unpin - toggles the native always-on-top flag (see togglePin
           in usePlaybackState.js), so the window can sit either above or
           below other windows. Sits above the corner drag handles (z-40 vs
@@ -95,7 +171,9 @@ export default function App() {
         {isPinned ? <Pin size={15} /> : <PinOff size={15} />}
       </button>
 
-      <div data-tauri-drag-region className="relative w-[340px] rounded-card bg-panel border border-white/10 shadow-2xl shadow-black/50 p-5">
+      <div data-tauri-drag-region className="relative w-[340px] rounded-card bg-panel border border-white/10 p-5">
+        {(playerError || playbackError) && <p role="alert" className="mb-2 text-xs text-red-400">{playerError || playbackError}</p>}
+        <fieldset disabled={musicToggling} className="min-w-0">
         <TransportControls
           art={current.art}
           isPlaying={isPlaying}
@@ -178,6 +256,7 @@ export default function App() {
             {panelMode === "queue" ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
           </button>
         </div>
+        </fieldset>
       </div>
     </div>
   );

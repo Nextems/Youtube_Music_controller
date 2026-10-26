@@ -18,8 +18,16 @@ export default function ProgressBar({
         onChange={(e) => onSeek(parseFloat(e.target.value))}
         // Fires once, on release - this is what actually seeks the real
         // player (see usePlaybackState.commitSeek).
-        onMouseUp={(e) => onSeekCommit(parseFloat(e.target.value))}
-        onTouchEnd={(e) => onSeekCommit(parseFloat(e.target.value))}
+        onPointerDown={(e) => e.currentTarget.setPointerCapture(e.pointerId)}
+        onPointerUp={(e) => onSeekCommit(parseFloat(e.currentTarget.value))}
+        onPointerCancel={(e) => onSeekCommit(parseFloat(e.currentTarget.value))}
+        onKeyUp={(e) => {
+          if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(e.key)) {
+            onSeekCommit(parseFloat(e.currentTarget.value));
+          }
+        }}
+        onBlur={(e) => onSeekCommit(parseFloat(e.currentTarget.value))}
+        aria-label="Playback position"
         className="w-full h-1 appearance-none rounded-full bg-white/20 accent-white cursor-pointer"
         style={{
           background: `linear-gradient(to right, white ${progress * 100}%, rgba(255,255,255,0.2) ${

@@ -1,15 +1,20 @@
 // Prevents an extra console window from popping up on Windows release builds.
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 // Baked into the binary at compile time - no file I/O needed at runtime.
 const YTM_WATCHER_JS: &str = include_str!("../scripts/ytm-watcher.js");
+const SPOTIFY_WATCHER_JS: &str = include_str!("../scripts/spotify-watcher.js");
 
-/// Runs an arbitrary JS string inside the hidden "main" (music.youtube.com)
-/// window. This is the ONLY custom command Step 2 needs: every action
-/// (play/pause, next, prev, seek, skip15) is just a different JS string
-/// built on the frontend (see src/lib/ytmBridge.js) and sent through here.
+#[tauri::command]
+fn spotify_eval(app: tauri::AppHandle, script: String) -> Result<(), String> {
+    app.get_webview_window("spotify")
+        .ok_or("Spotify window not found")?
+        .eval(&script).map_err(|e| e.to_string())
+}
+
+/// Executes an overlay command in the YouTube Music webview.
 #[tauri::command]
 fn ytm_eval(app: tauri::AppHandle, script: String) -> Result<(), String> {
     let window = app
@@ -18,44 +23,102 @@ fn ytm_eval(app: tauri::AppHandle, script: String) -> Result<(), String> {
     window.eval(&script).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_player_state(app: tauri::AppHandle) -> Result<(String, bool), String> {
+    for (provider, label) in [("ytm", "main"), ("spotify", "spotify")] {
+        if let Some(window) = app.get_webview_window(label) {
+            let visible = window.is_visible().map_err(|e| e.to_string())?
+                && !window.is_minimized().map_err(|e| e.to_string())?;
+            return Ok((provider.into(), visible));
+        }
+    }
+    Err("player window not found".into())
+}
+
+#[tauri::command]
+fn toggle_music_window(app: tauri::AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .or_else(|| app.get_webview_window("spotify"))
+        .ok_or_else(|| "player window not found".to_string())?;
+    let visible = window.is_visible().map_err(|e| e.to_string())?
+        && !window.is_minimized().map_err(|e| e.to_string())?;
+    if visible {
+        window.hide().map_err(|e| e.to_string())?;
+        window.set_skip_taskbar(true).map_err(|e| e.to_string())?;
+    } else {
+        window.set_skip_taskbar(false).map_err(|e| e.to_string())?;
+        window.show().map_err(|e| e.to_string())?;
+        window.unminimize().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(!visible)
+}
+
+#[tauri::command]
+async fn select_player(app: tauri::AppHandle, provider: String) -> Result<bool, String> {
+    create_player(&app, &provider, false).map_err(|e| e.to_string())
+}
+
+fn create_player(app: &tauri::AppHandle, provider: &str, visible: bool) -> tauri::Result<bool> {
+    let (label, other, title, url) = match provider {
+        "ytm" => ("main", "spotify", "YouTube Music", "https://music.youtube.com"),
+        "spotify" => ("spotify", "main", "Spotify", "https://open.spotify.com"),
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Unknown player").into()),
+    };
+    if let Some(window) = app.get_webview_window(label) {
+        window.set_skip_taskbar(false)?;
+        window.show()?;
+        window.unminimize()?;
+        window.set_focus()?;
+        return Ok(true);
+    }
+    let mut config = app.config().app.windows.iter()
+        .find(|window| window.label == "main")
+        .expect("main player config must exist").clone();
+    config.label = label.into();
+    config.title = title.into();
+    config.url = tauri::WebviewUrl::External(url.parse().expect("valid player URL"));
+    config.visible = visible;
+    config.skip_taskbar = !visible;
+    let mut builder = tauri::WebviewWindowBuilder::from_config(app, &config)?;
+    if provider == "ytm" {
+        builder = builder.initialization_script(YTM_WATCHER_JS);
+    } else {
+        builder = builder.initialization_script(SPOTIFY_WATCHER_JS);
+    }
+    let window = builder.build()?;
+    if let Some(previous) = app.get_webview_window(other) {
+        if let Err(error) = previous.destroy() {
+            let _ = window.destroy();
+            return Err(error);
+        }
+    }
+    let player = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if player.hide().is_ok() {
+                let _ = player.set_skip_taskbar(true);
+                let _ = player.emit_to("overlay", "player://visibility", false);
+            }
+        }
+    });
+    Ok(visible)
+}
+
 fn main() {
-    // Chromium/WebView2 throttles timers (setInterval) in windows that
-    // aren't focused and are visually occluded - which "main" almost
-    // always is, since "overlay" sits alwaysOnTop above it and "main"
-    // never takes focus (tauri.conf.json: focus: false). ytm-watcher.js's
-    // own timers (the 1s tick, the 200ms playback-drift guard) live
-    // inside that same throttled event loop - and critically, so does
-    // every ytm_eval() call below, since `window.eval()` has to run on
-    // that exact same JS thread. A user action from the overlay can
-    // therefore end up queued behind however long the throttle is
-    // currently stretching that window's timers to, which is the
-    // multi-second "action executes after the stall" symptom - not a
-    // rendering/compositor issue (nothing here shows up in a Performance
-    // trace of the OVERLAY window, since overlay's own renderer is idle
-    // and unaffected; only "main"'s trace/console would show it, via
-    // enableDiagnostics()'s timer-drift log with no matching long task).
-    // Must be set before Tauri creates any webview - WebView2 only reads
-    // this env var once, at its own process init.
+    // Both player webviews keep their DOM timers responsive while hidden.
+    // WebView2 reads these arguments before the first webview is created.
     std::env::set_var(
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding",
     );
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![ytm_eval])
+        .invoke_handler(tauri::generate_handler![ytm_eval, spotify_eval, get_player_state, toggle_music_window, select_player])
         .setup(|app| {
-            let main_window = app
-                .get_webview_window("main")
-                .expect("main window must exist (declared in tauri.conf.json)");
-
-            // Inject the watcher once at startup. The watcher script itself
-            // polls with setInterval until the player DOM is ready, so it
-            // doesn't matter if this runs before music.youtube.com has
-            // fully finished loading.
-            main_window
-                .eval(YTM_WATCHER_JS)
-                .expect("failed to inject YTM watcher script");
-
+            create_player(app.handle(), "ytm", true)?;
             Ok(())
         })
         .run(tauri::generate_context!())

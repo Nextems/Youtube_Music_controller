@@ -1,11 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Baseline capabilities for the overlay window's own bundled UI. The 'main' window never loads local/bundled content - it only ever shows the remote music.youtube.com page - so it doesn't need (and can't use) this capability. See remote-ytm.json for what 'main' actually needs.",
+  "description": "Local overlay permissions. Only this window can invoke application commands; remote player pages receive event permissions separately.",
   "windows": [
     "overlay"
   ],
   "permissions": [
+    "allow-ytm-eval",
+    "allow-spotify-eval",
+    "allow-get-player-state",
+    "allow-toggle-music-window",
+    "allow-select-player",
     "core:default",
     "core:window:allow-set-size",
     "core:window:allow-set-always-on-top",
