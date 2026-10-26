@@ -122,21 +122,15 @@ export function setPlaylistsPanelOpen(open) {
 // Queue references are stable IDs assigned by the watcher.
 // ---------------------------------------------------------------------
 
-export function selectQueueItem(index) {
+export function selectQueueItem(id) {
   return evalInMain(`
     (function () {
-      const el = window.__ymoverlay.getQueueItem(${JSON.stringify(index)});
+      const el = window.__ymoverlay.getQueueItem(${JSON.stringify(id)});
       if (!el) return;
 
-      const candidates = [
-        el.querySelector(".song-info"),
-        el.querySelector(".thumbnail-and-text"),
-        el.querySelector("[role='button']"),
-        el.shadowRoot && el.shadowRoot.querySelector("#thumbnail, .song-info, [role='button']"),
-      ].filter(Boolean);
-
-      // One bubbling click reaches both the inner control and its host.
-      (candidates[0] || el).click();
+      const play = el.querySelector("ytmusic-play-button-renderer");
+      // The title block does not start playback in YTM's current queue.
+      (play?.querySelector(".content-wrapper") || play || el).click();
     })();
   `);
 }
