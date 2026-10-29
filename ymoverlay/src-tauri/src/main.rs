@@ -2,6 +2,73 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use tauri::{Emitter, Manager};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct OverlayState {
+    pinned: AtomicBool,
+}
+
+#[tauri::command]
+fn set_overlay_pinned(app: tauri::AppHandle, pinned: bool) -> Result<(), String> {
+    let window = app.get_webview_window("overlay").ok_or("Overlay window not found")?;
+    // Synchronous commands and the maintenance callback run on the window thread.
+    window.set_always_on_top(pinned).map_err(|error| error.to_string())?;
+    app.state::<OverlayState>().pinned.store(pinned, Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn maintain_overlay(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, IsWindowVisible, SetWindowPos, ShowWindow, HWND_TOPMOST,
+        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    if let Ok(hwnd) = window.hwnd() {
+        // Tauri's cached always-on-top flag alone cannot repair Z-order:
+        // another topmost window can be inserted above us without changing it.
+        // Never activate the overlay or take keyboard focus from the user.
+        unsafe {
+            if IsIconic(hwnd.0) != 0 || IsWindowVisible(hwnd.0) == 0 {
+                ShowWindow(hwnd.0, SW_SHOWNOACTIVATE);
+            }
+            if SetWindowPos(hwnd.0, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE) == 0 {
+                eprintln!("Cannot restore overlay Z-order: {}", std::io::Error::last_os_error());
+            }
+        }
+    }
+}
+
+fn setup_overlay(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let overlay = app.get_webview_window("overlay").expect("overlay config must exist");
+    let handle = app.clone();
+    overlay.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            // The hidden player keeps the event loop alive if only this window
+            // closes. Exit Tauri so every webview and its browser is cleaned up.
+            api.prevent_close();
+            handle.state::<OverlayState>().pinned.store(false, Ordering::Relaxed);
+            handle.exit(0);
+        }
+    });
+    #[cfg(windows)]
+    {
+        let handle = app.clone();
+        std::thread::Builder::new().name("overlay-visibility".into()).spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(750));
+                let Some(window) = handle.get_webview_window("overlay") else { break };
+                let app = handle.clone();
+                if window.clone().run_on_main_thread(move || {
+                    if app.state::<OverlayState>().pinned.load(Ordering::Relaxed) {
+                        maintain_overlay(&window);
+                    }
+                }).is_err() { break; }
+            }
+        })?;
+    }
+    Ok(())
+}
 
 // Baked into the binary at compile time - no file I/O needed at runtime.
 const YTM_WATCHER_JS: &str = include_str!("../scripts/ytm-watcher.js");
@@ -116,8 +183,10 @@ fn main() {
     );
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![ytm_eval, spotify_eval, get_player_state, toggle_music_window, select_player])
+        .manage(OverlayState { pinned: AtomicBool::new(true) })
+        .invoke_handler(tauri::generate_handler![ytm_eval, spotify_eval, get_player_state, toggle_music_window, select_player, set_overlay_pinned])
         .setup(|app| {
+            setup_overlay(app.handle())?;
             create_player(app.handle(), "ytm", true)?;
             Ok(())
         })

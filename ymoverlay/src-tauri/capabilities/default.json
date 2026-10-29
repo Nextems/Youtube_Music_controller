@@ -11,9 +11,9 @@
     "allow-get-player-state",
     "allow-toggle-music-window",
     "allow-select-player",
+    "allow-set-overlay-pinned",
     "core:default",
     "core:window:allow-set-size",
-    "core:window:allow-set-always-on-top",
     "core:window:allow-start-dragging"
   ]
 }

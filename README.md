@@ -38,6 +38,8 @@ Other platforms are not tested. Parts of the code are Windows/WebView2-specific.
 
 Closing the player window hides it while music continues. Use the monitor button to show it again. The left buttons switch between YouTube Music and Spotify; switching destroys the previous player window.
 
+**Alt+F4 on the overlay exits the entire application**, including the hidden player and its WebView2. Alt+F4 on the player only hides it. On Windows, a pinned overlay restores its visibility and topmost position every 750 ms without taking focus; unpinning disables this maintenance. Protected system screens and exclusive fullscreen applications can still cover ordinary overlay windows.
+
 ## Usage
 
 | What | How |

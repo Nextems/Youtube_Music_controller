@@ -34,6 +34,7 @@
         "minHeight": 380,
         "resizable": false,
         "maximizable": false,
+        "minimizable": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

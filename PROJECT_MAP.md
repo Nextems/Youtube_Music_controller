@@ -276,10 +276,23 @@ ytmusic-guide-section-renderer
 ### 4.7 Pin / Unpin (always-on-top)
 
 `isPinned` в `usePlaybackState.js`, стартует в `true` (совпадает с
-`"alwaysOnTop": true` в `tauri.conf.json`). `togglePin()` дергает
-`getCurrentWindow().setAlwaysOnTop()`. Требует право
-`core:window:allow-set-always-on-top` в `capabilities/default.json`. Кнопка в
+`"alwaysOnTop": true` в `tauri.conf.json`). `togglePin()` вызывает команду
+`set_overlay_pinned` (разрешение `allow-set-overlay-pinned` только для локального
+оверлея). Команда обновляет нативный флаг и `OverlayState.pinned`. Кнопка в
 `App.jsx` — оранжевая, когда закреплено.
+
+На Windows `setup_overlay()` каждые 750 мс передаёт проверку в главный поток.
+Если закрепление включено, `maintain_overlay()` восстанавливает скрытое/свёрнутое
+окно через `SW_SHOWNOACTIVATE` и поднимает его в Z-order через
+`SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE)`.
+Повторный `set_always_on_top(true)` здесь недостаточен: Tao сравнивает новый
+флаг с сохранённым и может не вызвать `SetWindowPos`. Проверка не перехватывает
+фокус и не выполняется при отключённой булавке. Сворачивание оверлея отключено
+в конфигурации. Защищённые системные экраны и эксклюзивный fullscreen не покрыты.
+
+Закрытие окна `overlay` (включая Alt+F4) вызывает `AppHandle::exit(0)`, чтобы
+Tauri завершил всё приложение и очистил WebView2. Закрытие окон плееров
+по-прежнему только скрывает их; нельзя распространять этот обработчик на оверлей.
 
 ### 4.8 Перетаскивание окна и скролл списков
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import * as youtube from "../lib/ytmBridge.js";
 import * as spotify from "../lib/spotifyBridge.js";
@@ -530,7 +531,7 @@ export function usePlaybackState(provider = "ytm") {
     pinBusy.current = true;
     const next = !isPinned;
     setIsPinned(next);
-    getCurrentWindow().setAlwaysOnTop(next).catch((error) => {
+    invoke("set_overlay_pinned", { pinned: next }).catch((error) => {
       setIsPinned(!next);
       setPlaybackError(String(error));
     }).finally(() => { pinBusy.current = false; });
